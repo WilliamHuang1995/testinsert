@@ -13,9 +13,9 @@ import (
 
 const (
 	dbName          = "balance_atomic.db"
-	initialBalance  = 100
-	decrementAmount = 1  // The amount to subtract in each transaction
-	numTransactions = 99 // Trying to decrement 99 times
+	initialBalance  = 10000
+	decrementAmount = 1    // The amount to subtract in each transaction
+	numTransactions = 9999 // Trying to decrement 99 times
 )
 
 func main() {
@@ -41,7 +41,7 @@ func main() {
 	// 4. Run concurrent transactions
 	var wg sync.WaitGroup
 	successfulTx := make(chan bool, numTransactions) // Channel to count successful transactions
-
+	log.Println("Starting concurrent transactions...")
 	for i := 0; i < numTransactions; i++ {
 		wg.Add(1)
 		go func(txNum int) {
@@ -79,9 +79,9 @@ func main() {
 	fmt.Printf("Actual final balance: %d\n", finalBal)
 
 	if finalBal == initialBalance-countSuccessful {
-		fmt.Println("Result: The final balance is correct based on successful decrements!")
+		log.Println("Result: The final balance is correct based on successful decrements!")
 	} else {
-		fmt.Println("Result: The final balance is INCORRECT. Concurrency issues may have occurred.")
+		log.Println("Result: The final balance is INCORRECT. Concurrency issues may have occurred.")
 	}
 	fmt.Printf("Final balance should be > 0. Is it %t\n", finalBal > 0)
 }
