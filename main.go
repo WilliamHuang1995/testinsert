@@ -18,9 +18,9 @@ const (
 	dbPort     = "3306"         // Your MariaDB port
 	dbName     = "testdb"       // Your MariaDB database name
 
-	initialBalance  = 1000 // The conceptual initial balance for the account
-	numTransactions = 999  // Total number of transactions for the account
-	decrementAmount = 1    // The amount to decrement in each transaction
+	initialBalance  = 10 // The conceptual initial balance for the account
+	numTransactions = 9  // Total number of transactions for the account
+	decrementAmount = 1  // The amount to decrement in each transaction
 
 	logicalAccountID = 1 // The ID of the single account being tested
 )
