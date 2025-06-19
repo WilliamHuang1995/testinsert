@@ -12,26 +12,32 @@ import (
 )
 
 const (
-	dbUser          = "testuser"     // Your MariaDB username
-	dbPassword      = "testpassword" // Your MariaDB password
-	dbHost          = "127.0.0.1"    // Your MariaDB host (e.g., localhost or an IP)
-	dbPort          = "3306"         // Your MariaDB port
-	dbName          = "testdb"       // Your MariaDB database name
-	initialBalance  = 1000
-	numTransactions = 999
-	decrementAmount = 1 // The amount to decrement in each transaction
+	dbUser     = "testuser"     // Your MariaDB username
+	dbPassword = "testpassword" // Your MariaDB password
+	dbHost     = "127.0.0.1"    // Your MariaDB host (e.g., localhost or an IP)
+	dbPort     = "3306"         // Your MariaDB port
+	dbName     = "testdb"       // Your MariaDB database name
 
-	logicalAccountID = 1 // The ID of the single account being tested for running balance
+	initialBalance  = 1000 // The conceptual initial balance for the account
+	numTransactions = 999  // Total number of transactions for the account
+	decrementAmount = 1    // The amount to decrement in each transaction
+
+	logicalAccountID = 1 // The ID of the single account being tested
 )
 
+// db is the single database connection for the application
+var db *sql.DB
+
 func main() {
+	// --- Database Connection Setup ---
 	dsn := fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?parseTime=true", dbUser, dbPassword, dbHost, dbPort, dbName)
 
-	db, err := sql.Open("mysql", dsn)
+	var err error
+	db, err = sql.Open("mysql", dsn)
 	if err != nil {
 		log.Fatalf("Failed to open database connection: %v", err)
 	}
-	defer db.Close()
+	defer db.Close() // Ensure the connection is closed when main exits
 
 	err = db.Ping()
 	if err != nil {
@@ -39,37 +45,42 @@ func main() {
 	}
 	log.Println("Successfully connected to MariaDB!")
 
-	db.SetMaxOpenConns(20)
-	db.SetMaxIdleConns(10)
+	// Set connection pool settings for this single database
+	db.SetMaxOpenConns(20) // Maximum number of open connections
+	db.SetMaxIdleConns(10) // Maximum number of idle connections
 	db.SetConnMaxLifetime(5 * time.Minute)
-	db.SetConnMaxIdleTime(5 * time.Minute) // Good practice
+	db.SetConnMaxIdleTime(5 * time.Minute) // Close idle connections after this time
 
-	if err = setupDatabase(db); err != nil {
-		log.Fatalf("Failed to set up database: %v", err)
+	// --- Database Schema Setup ---
+	// Setup database: only transactions_history table, with a genesis entry
+	if err = setupTransactionHistoryOnlyDatabase(); err != nil {
+		log.Fatalf("Failed to set up database with only transaction history: %v", err)
 	}
 
-	log.Printf("--- Starting Simulation with History Table and Running Balance --- \n")
-	log.Printf("Initial balance for account %d set to %d.\n", logicalAccountID, initialBalance)
+	log.Printf("--- Starting Simulation (History-Only Ledger) ---\n")
+	log.Printf("Conceptual initial balance for account %d: %d.\n", logicalAccountID, initialBalance)
 	log.Printf("Total transactions to perform: %d.\n", numTransactions)
 
 	startTime := time.Now()
 
+	// --- Concurrent Transaction Processing ---
 	var wg sync.WaitGroup
-	numWorkers := db.Stats().MaxOpenConnections
-	jobs := make(chan int, numTransactions)
+	numWorkers := db.Stats().MaxOpenConnections // Use pool size as worker limit
+	jobs := make(chan int, numTransactions)     // Buffered channel for jobs
 
+	// Start worker goroutines
 	for w := 0; w < numWorkers; w++ {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
 			for txNum := range jobs {
-				err := decrementBalanceWithHistory(db, txNum, logicalAccountID, decrementAmount)
+				err := processLedgerTransaction(txNum, logicalAccountID, decrementAmount) // Pass db implicit via global
 				if err != nil {
-					// Basic retry for transient errors
+					// Basic retry logic for transient errors like deadlock/invalid connection
 					if strings.Contains(err.Error(), "Deadlock found") || strings.Contains(err.Error(), "invalid connection") {
 						log.Printf("Worker %d, Transaction %d failed (transient error): %v. Retrying...", workerID, txNum, err)
-						time.Sleep(50 * time.Millisecond)
-						err = decrementBalanceWithHistory(db, txNum, logicalAccountID, decrementAmount)
+						time.Sleep(50 * time.Millisecond)                                        // Short delay before retry
+						err = processLedgerTransaction(txNum, logicalAccountID, decrementAmount) // Retry
 						if err != nil {
 							log.Printf("Worker %d, Transaction %d failed (after retry): %v", workerID, txNum, err)
 						}
@@ -81,147 +92,141 @@ func main() {
 		}(w)
 	}
 
+	// Distribute transaction numbers to job channel
 	for i := 0; i < numTransactions; i++ {
 		jobs <- (i + 1)
 	}
-	close(jobs)
+	close(jobs) // Close the channel to signal workers no more jobs will be sent
 
-	wg.Wait()
+	wg.Wait() // Wait for all worker goroutines to complete their jobs
 	duration := time.Since(startTime)
 	log.Printf("All transactions completed in %s\n", duration)
 
-	finalBal, err := getBalance(db, logicalAccountID)
+	// --- Final Balance Verification ---
+	// Get final balance by querying the latest from transaction history
+	finalBal, err := getLatestRunningBalanceFromHistory(logicalAccountID)
 	if err != nil {
-		log.Fatalf("Failed to get final balance for account %d: %v", logicalAccountID, err)
+		log.Fatalf("Failed to get final balance from history for account %d: %v", logicalAccountID, err)
 	}
 
-	fmt.Printf("\n--- Simulation Complete ---\n")
-	fmt.Printf("Initial Balance for Account %d: %d\n", logicalAccountID, initialBalance)
-	fmt.Printf("Number of transactions: %d\n", numTransactions)
+	fmt.Printf("\n--- Simulation Complete (History-Only Ledger) ---\n")
+	fmt.Printf("Conceptual Initial Balance for Account %d: %d\n", logicalAccountID, initialBalance)
+	fmt.Printf("Number of transactions attempted: %d\n", numTransactions)
 	fmt.Printf("Expected final balance for Account %d: %d\n", logicalAccountID, initialBalance-numTransactions)
-	fmt.Printf("Actual final balance for Account %d: %d\n", logicalAccountID, finalBal)
+	fmt.Printf("Actual final balance from History for Account %d: %d\n", logicalAccountID, finalBal)
 
-	if finalBal == initialBalance-numTransactions {
-		log.Println("Result: The final balance in 'accounts' table is correct!")
-	} else {
-		log.Println("Result: The final balance in 'accounts' table is INCORRECT. Concurrency issues may have occurred.")
-	}
-
-	count, err := getTransactionHistoryCount(db, logicalAccountID)
+	// Calculate and print total successful entries, and check against expected
+	successfulTxCount, err := getTransactionHistoryCount(logicalAccountID)
 	if err != nil {
-		log.Printf("Failed to get transaction history count: %v", err)
+		log.Printf("Failed to get total history count: %v", err)
 	} else {
-		log.Printf("Total transaction history entries for account %d: %d\n", logicalAccountID, count)
-	}
+		// Subtract 1 for the initial "genesis" entry
+		actualSuccessfulDecrements := successfulTxCount - 1
+		log.Printf("Total successful transaction entries in history for account %d: %d\n", logicalAccountID, actualSuccessfulDecrements)
 
-	// Verify the last recorded running balance in history
-	lastHistoryBalance, err := getLastRunningBalanceFromHistory(db, logicalAccountID)
-	if err != nil {
-		log.Printf("Failed to get last running balance from history: %v", err)
-	} else {
-		log.Printf("Last recorded running balance in history for account %d: %d\n", logicalAccountID, lastHistoryBalance)
-		if lastHistoryBalance == finalBal {
-			log.Println("Consistency Check: Last history balance matches current running balance.")
+		// A more robust check for this ledger-only model:
+		// The final balance should equal initialBalance minus total successful decrements.
+		if finalBal == initialBalance-(actualSuccessfulDecrements*decrementAmount) {
+			log.Println("Result: History reflects correct total deductions and final balance!")
 		} else {
-			log.Println("Consistency Check: Last history balance DOES NOT match current running balance! (This indicates an issue)")
+			log.Println("Result: History MAY be inconsistent with final balance. Check logs for failures.")
 		}
 	}
 }
 
-// setupDatabase initializes the accounts and transactions_history tables.
-func setupDatabase(db *sql.DB) error {
-	// Drop accounts table if it exists
-	_, err := db.Exec(`DROP TABLE IF EXISTS accounts;`)
-	if err != nil {
-		return fmt.Errorf("failed to drop accounts table: %w", err)
-	}
-
-	// Create accounts table (for running balance)
-	_, err = db.Exec(`
-		CREATE TABLE accounts (
-			id INT PRIMARY KEY,
-			balance INT NOT NULL
-		);
-	`)
-	if err != nil {
-		return fmt.Errorf("failed to create accounts table: %w", err)
-	}
-
-	// Insert initial balance for the logicalAccountID
-	_, err = db.Exec(`
-		INSERT INTO accounts (id, balance) VALUES (?, ?);
-	`, logicalAccountID, initialBalance)
-	if err != nil {
-		return fmt.Errorf("failed to insert initial balance into accounts table: %w", err)
-	}
-
+// setupTransactionHistoryOnlyDatabase initializes only the transactions_history table
+// with a starting "genesis" balance entry.
+func setupTransactionHistoryOnlyDatabase() error {
 	// Drop transactions_history table if it exists
-	_, err = db.Exec(`DROP TABLE IF EXISTS transactions_history;`)
+	_, err := db.Exec(`DROP TABLE IF EXISTS transactions_history;`)
 	if err != nil {
 		return fmt.Errorf("failed to drop transactions_history table: %w", err)
 	}
 
-	// Create transactions_history table with the new 'running_balance' column
+	// Create transactions_history table with the 'running_balance' column
+	// Use BIGINT for primary key for high volumes
+	// Use TIMESTAMP(6) for microseconds precision
 	_, err = db.Exec(`
 		CREATE TABLE transactions_history (
-			id INT AUTO_INCREMENT PRIMARY KEY,
+			id BIGINT AUTO_INCREMENT PRIMARY KEY,
 			account_id INT NOT NULL,
-			amount INT NOT NULL,
-			running_balance INT NOT NULL,      -- NEW COLUMN
-			transaction_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+			amount INT NOT NULL,               -- Amount of this specific transaction (e.g., -1 for a debit)
+			running_balance INT NOT NULL,      -- Balance AFTER this transaction
+			transaction_time TIMESTAMP(6) DEFAULT CURRENT_TIMESTAMP(6)
 		);
 	`)
 	if err != nil {
 		return fmt.Errorf("failed to create transactions_history table: %w", err)
 	}
-	// Add an index on account_id and transaction_time for faster lookups/ordering
-	_, err = db.Exec(`CREATE INDEX idx_transactions_history_account_id_time ON transactions_history(account_id, transaction_time DESC);`)
+	// Add a composite index for querying latest balance efficiently
+	_, err = db.Exec(`CREATE INDEX idx_transactions_history_account_id_time ON transactions_history(account_id, transaction_time DESC, id DESC);`)
 	if err != nil {
 		return fmt.Errorf("failed to create index on transactions_history: %w", err)
 	}
 
-	log.Println("Database setup complete: 'accounts' and 'transactions_history' tables created.")
+	// Insert the initial "genesis" balance entry for the logicalAccountID
+	// This record represents the starting point of the ledger.
+	// For a genesis entry, the 'amount' could be the initial balance itself.
+	_, err = db.Exec(`
+		INSERT INTO transactions_history (account_id, amount, running_balance)
+		VALUES (?, ?, ?);
+	`, logicalAccountID, initialBalance, initialBalance)
+	if err != nil {
+		return fmt.Errorf("failed to insert genesis entry into transactions_history: %w", err)
+	}
+	log.Println("Database setup complete: 'transactions_history' table created with genesis entry.")
 	return nil
 }
 
-// decrementBalanceWithHistory updates the running balance and inserts a history record atomically.
-func decrementBalanceWithHistory(db *sql.DB, txNum int, accountID int, amount int) error {
-	tx, err := db.Begin()
+// processLedgerTransaction handles a single transaction in a history-only ledger model.
+// It queries for the latest balance, performs application-side calculation, and inserts a new record.
+func processLedgerTransaction(txNum int, accountID int, debitAmount int) error {
+	tx, err := db.Begin() // Start a transaction for atomicity of read-calculate-write
 	if err != nil {
 		return fmt.Errorf("transaction %d: failed to begin transaction: %w", txNum, err)
 	}
-	defer tx.Rollback() // Rollback on error or if not committed
+	defer tx.Rollback() // Ensure rollback on error or if not explicitly committed
 
-	// Step 1: Update the running balance in the accounts table
-	result, err := tx.Exec("UPDATE accounts SET balance = balance - ? WHERE id = ? AND balance >= ?", amount, accountID, amount)
+	var latestRunningBalance int
+	// Step 1: Query for the latest running balance for the account_id.
+	// Use FOR UPDATE to lock the relevant index records to prevent race conditions during this read-modify-write cycle.
+	err = tx.QueryRow(
+		"SELECT running_balance FROM transactions_history WHERE account_id = ? ORDER BY transaction_time DESC, id DESC LIMIT 1 FOR UPDATE",
+		accountID,
+	).Scan(&latestRunningBalance)
+
+	// Determine the base balance for the calculation.
+	// If no prior entries (shouldn't happen if genesis is always inserted first), use initialBalance.
+	currentBaseBalance := initialBalance // Default if no rows found (e.g., first ever transaction for an account)
 	if err != nil {
-		return fmt.Errorf("transaction %d: failed to update accounts table: %w", txNum, err)
+		if err == sql.ErrNoRows {
+			// This case should ideally not happen for logicalAccountID=1 if genesis is inserted.
+			// It would happen for other accountIDs if they don't have a genesis entry.
+			log.Printf("Transaction %d: No prior history found for account %d. Starting from conceptual initial balance.", txNum, accountID)
+		} else {
+			return fmt.Errorf("transaction %d: failed to query latest running balance: %w", txNum, err)
+		}
+	} else {
+		currentBaseBalance = latestRunningBalance
 	}
 
-	rowsAffected, err := result.RowsAffected()
+	// Step 2: Application-side calculation and check
+	newRunningBalance := currentBaseBalance - debitAmount
+	if newRunningBalance < 0 { // Check if balance would drop below zero
+		return fmt.Errorf("transaction %d: insufficient balance. Current: %d, Debit: %d. New balance would be %d", txNum, currentBaseBalance, debitAmount, newRunningBalance)
+	}
+
+	// Step 3: Create a new entry back into transaction history with the updated running balance
+	// Store the debit as a negative amount in the 'amount' column.
+	_, err = tx.Exec(
+		"INSERT INTO transactions_history (account_id, amount, running_balance) VALUES (?, ?, ?)",
+		accountID, -debitAmount, newRunningBalance,
+	)
 	if err != nil {
-		return fmt.Errorf("transaction %d: failed to get rows affected from accounts update: %w", txNum, err)
+		return fmt.Errorf("transaction %d: failed to insert new history entry: %w", txNum, err)
 	}
 
-	if rowsAffected == 0 {
-		// This means the WHERE condition (balance >= amount) was not met.
-		return fmt.Errorf("transaction %d: insufficient balance or account %d not found", txNum, accountID)
-	}
-
-	// Step 2: Get the NEW current balance AFTER the update (within the same transaction)
-	var currentBalance int
-	err = tx.QueryRow("SELECT balance FROM accounts WHERE id = ?", accountID).Scan(&currentBalance)
-	if err != nil {
-		return fmt.Errorf("transaction %d: failed to read current balance after update: %w", txNum, err)
-	}
-
-	// Step 3: Insert a record into the transactions_history table with the running balance
-	_, err = tx.Exec("INSERT INTO transactions_history (account_id, amount, running_balance) VALUES (?, ?, ?)", accountID, amount, currentBalance)
-	if err != nil {
-		return fmt.Errorf("transaction %d: failed to insert into transactions_history: %w", txNum, err)
-	}
-
-	// Step 4: Commit the transaction
+	// Commit the transaction
 	err = tx.Commit()
 	if err != nil {
 		return fmt.Errorf("transaction %d: failed to commit: %w", txNum, err)
@@ -229,38 +234,27 @@ func decrementBalanceWithHistory(db *sql.DB, txNum int, accountID int, amount in
 	return nil
 }
 
-// getBalance retrieves the current running balance for a specific account from the accounts table.
-func getBalance(db *sql.DB, accountID int) (int, error) {
+// getLatestRunningBalanceFromHistory retrieves the running_balance of the most recent transaction for a specific account.
+func getLatestRunningBalanceFromHistory(accountID int) (int, error) {
 	var balance int
-	err := db.QueryRow("SELECT balance FROM accounts WHERE id = ?", accountID).Scan(&balance)
+	// Order by transaction_time DESC (most recent first) and then id DESC (to break ties for same timestamp)
+	err := db.QueryRow("SELECT running_balance FROM transactions_history WHERE account_id = ? ORDER BY transaction_time DESC, id DESC LIMIT 1", accountID).Scan(&balance)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			return 0, fmt.Errorf("account %d not found in accounts table", accountID)
+			// If no entries are found (e.g., table empty or account never had a transaction)
+			return 0, fmt.Errorf("no history found for account %d", accountID)
 		}
-		return 0, fmt.Errorf("failed to query balance for account %d: %w", accountID, err)
+		return 0, fmt.Errorf("failed to get last running balance from history for account %d: %w", accountID, err)
 	}
 	return balance, nil
 }
 
 // getTransactionHistoryCount retrieves the total number of history entries for a specific account.
-func getTransactionHistoryCount(db *sql.DB, accountID int) (int, error) {
+func getTransactionHistoryCount(accountID int) (int, error) {
 	var count int
 	err := db.QueryRow("SELECT COUNT(*) FROM transactions_history WHERE account_id = ?", accountID).Scan(&count)
 	if err != nil {
 		return 0, fmt.Errorf("failed to query history count for account %d: %w", accountID, err)
 	}
 	return count, nil
-}
-
-// getLastRunningBalanceFromHistory retrieves the running_balance of the most recent transaction for an account.
-func getLastRunningBalanceFromHistory(db *sql.DB, accountID int) (int, error) {
-	var balance int
-	err := db.QueryRow("SELECT running_balance FROM transactions_history WHERE account_id = ? ORDER BY transaction_time DESC, id DESC LIMIT 1", accountID).Scan(&balance)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return 0, fmt.Errorf("no history found for account %d", accountID)
-		}
-		return 0, fmt.Errorf("failed to get last running balance from history for account %d: %w", accountID, err)
-	}
-	return balance, nil
 }
