@@ -1,76 +1,63 @@
 package main
 
 import (
-	"context" // For Redis context
+	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
-	"strconv" // For converting int to string for Redis keys
-	"strings" // For error string matching
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
-	"github.com/go-redis/redis/v8"     // Redis client
-	_ "github.com/go-sql-driver/mysql" // MariaDB/MySQL driver
+	"github.com/bsm/redislock" // New: Redis distributed lock
+	_ "github.com/go-sql-driver/mysql"
+	goRedis "github.com/redis/go-redis/v9" // New: go-redis/v9 client
 )
 
 const (
-	dbUser     = "testuser"     // Your MariaDB username
-	dbPassword = "testpassword" // Your MariaDB password
-	dbHost     = "127.0.0.1"    // Your MariaDB host (e.g., localhost or an IP)
-	dbPort     = "3306"         // Your MariaDB port
-	dbName     = "testdb"       // Your MariaDB database name
+	dbUser     = "testuser"
+	dbPassword = "testpassword"
+	dbHost     = "127.0.0.1"
+	dbPort     = "3306"
+	dbName     = "testdb"
 
-	redisAddr = "localhost:6379" // Redis server address
+	redisAddr = "localhost:6379"
 
-	initialBalance  = 1000 // The conceptual initial balance for the account
-	numTransactions = 999  // Total number of transactions for the account
-	decrementAmount = 1    // The amount to decrement in each transaction
+	initialBalance  = 10
+	numTransactions = 9
+	decrementAmount = 1
 
-	logicalAccountID = 1 // The ID of the single account being tested
+	logicalAccountID = 1
 
-	// Lua script for atomic conditional decrement in Redis
-	// KEYS[1] = account balance key (e.g., "account:balance:1")
-	// ARGV[1] = amount to decrement
-	// ARGV[2] = initialBalance (used if key doesn't exist yet, for first transaction)
-	redisConditionalDecrementScript = `
-        local current_balance = redis.call('GET', KEYS[1])
-
-        if current_balance == false then -- Key does not exist, treat as initial state
-            current_balance = tonumber(ARGV[2])
-        else
-            current_balance = tonumber(current_balance)
-        end
-
-        local new_balance = current_balance - tonumber(ARGV[1])
-
-        if new_balance >= 0 then
-            redis.call('SET', KEYS[1], new_balance)
-            return new_balance -- Return the new balance if successful
-        else
-            return -1 -- Indicate insufficient funds
-        end
-    `
+	spendableBalanceCache = "account:balance" // Base key for Redis
 )
 
-// Global database connection and Redis client
 var (
 	mariadbDB   *sql.DB
-	redisClient *redis.Client
-	ctx         = context.Background() // Context for Redis operations
+	redisClient *goRedis.Client   // Changed to goRedis.Client for v9
+	redisLocker *redislock.Client // New: Redis locker from bsm/redislock
+	ctx         = context.Background()
 )
 
+// Define custom errors mirroring production code for clarity
+var ErrInsufficientSpendableBalance = errors.New("insufficient spendable balance")
+var ErrLockNotObtained = errors.New("lock not obtained")
+
 func main() {
-	// --- Redis Client Setup ---
-	redisClient = redis.NewClient(&redis.Options{
+	// --- Redis Client and Locker Setup ---
+	redisClient = goRedis.NewClient(&goRedis.Options{
 		Addr: redisAddr,
-		DB:   0, // Default DB
+		DB:   0,
 	})
 	_, err := redisClient.Ping(ctx).Result()
 	if err != nil {
 		log.Fatalf("Failed to connect to Redis: %v", err)
 	}
 	log.Println("Successfully connected to Redis!")
+
+	redisLocker = redislock.New(redisClient) // Initialize the locker with the go-redis client
 
 	// --- MariaDB Connection Setup ---
 	dsn := fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?parseTime=true", dbUser, dbPassword, dbHost, dbPort, dbName)
@@ -80,7 +67,7 @@ func main() {
 		log.Fatalf("Failed to open MariaDB connection: %v", err)
 	}
 	defer mariadbDB.Close()   // Ensure connection is closed
-	defer redisClient.Close() // Ensure Redis connection is closed
+	defer redisClient.Close() // Ensure Redis connection is closed (handles multiple connections if pooled internally)
 
 	err = mariadbDB.Ping()
 	if err != nil {
@@ -105,7 +92,7 @@ func main() {
 		log.Fatalf("Failed to set up initial balance in Redis: %v", err)
 	}
 
-	log.Printf("--- Starting Simulation (Redis for Balance, MariaDB for History) ---\n")
+	log.Printf("--- Starting Simulation (Redis Lock, MariaDB for History) ---\n")
 	log.Printf("Conceptual initial balance for account %d in Redis: %d.\n", logicalAccountID, initialBalance)
 	log.Printf("Total transactions to perform: %d.\n", numTransactions)
 
@@ -113,8 +100,9 @@ func main() {
 
 	// --- Concurrent Transaction Processing ---
 	var wg sync.WaitGroup
-	numWorkers := mariadbDB.Stats().MaxOpenConnections // Use MariaDB pool size as worker limit
-	jobs := make(chan int, numTransactions)            // Buffered channel for jobs
+	// Use MariaDB pool size as worker limit, as each worker needs a DB connection for history
+	numWorkers := mariadbDB.Stats().MaxOpenConnections
+	jobs := make(chan int, numTransactions) // Buffered channel to send transaction numbers to workers
 
 	for w := 0; w < numWorkers; w++ {
 		wg.Add(1)
@@ -123,11 +111,11 @@ func main() {
 			for txNum := range jobs {
 				err := processRedisLedgerTransaction(txNum, logicalAccountID, decrementAmount)
 				if err != nil {
-					// Basic retry for transient errors like deadlock/invalid connection
-					if strings.Contains(err.Error(), "Deadlock found") || strings.Contains(err.Error(), "invalid connection") || strings.Contains(err.Error(), "OOM command not allowed when used memory > 'maxmemory'") {
+					// Basic retry for transient errors like deadlock/invalid connection/lock not obtained
+					if strings.Contains(err.Error(), "Deadlock found") || errors.Is(err, ErrLockNotObtained) || strings.Contains(err.Error(), "invalid connection") {
 						log.Printf("Worker %d, Transaction %d failed (transient error): %v. Retrying...", workerID, txNum, err)
 						time.Sleep(50 * time.Millisecond)                                             // Short delay before retry
-						err = processRedisLedgerTransaction(txNum, logicalAccountID, decrementAmount) // Retry
+						err = processRedisLedgerTransaction(txNum, logicalAccountID, decrementAmount) // Retry the transaction
 						if err != nil {
 							log.Printf("Worker %d, Transaction %d failed (after retry): %v", workerID, txNum, err)
 						}
@@ -139,23 +127,23 @@ func main() {
 		}(w)
 	}
 
+	// Distribute transaction numbers to the job channel
 	for i := 0; i < numTransactions; i++ {
 		jobs <- (i + 1)
 	}
-	close(jobs)
+	close(jobs) // Close the channel to signal workers no more jobs will be sent
 
-	wg.Wait()
+	wg.Wait() // Wait for all worker goroutines to complete their jobs
 	duration := time.Since(startTime)
 	log.Printf("All transactions completed in %s\n", duration)
 
 	// --- Final Balance Verification ---
-	// Get final balance from Redis
 	finalRedisBal, err := getRedisBalance(logicalAccountID)
 	if err != nil {
 		log.Fatalf("Failed to get final balance from Redis for account %d: %v", logicalAccountID, err)
 	}
 
-	fmt.Printf("\n--- Simulation Complete (Redis for Balance, MariaDB for History) ---\n")
+	fmt.Printf("\n--- Simulation Complete (Redis Lock, MariaDB for History) ---\n")
 	fmt.Printf("Conceptual Initial Balance: %d\n", initialBalance)
 	fmt.Printf("Number of transactions attempted: %d\n", numTransactions)
 	fmt.Printf("Expected final balance: %d\n", initialBalance-numTransactions)
@@ -167,24 +155,23 @@ func main() {
 		log.Println("Result: The final balance in Redis is INCORRECT. Balance calculation issues may have occurred.")
 	}
 
-	// Check MariaDB history count
 	successfulTxCount, err := getTransactionHistoryCount(logicalAccountID)
 	if err != nil {
 		log.Printf("Failed to get total history count from MariaDB: %v", err)
 	} else {
 		log.Printf("Total successful transaction entries in MariaDB history for account %d: %d\n", logicalAccountID, successfulTxCount)
-		// Expected history count should match numTransactions if all succeeded.
+		// Check if history count matches the number of attempted transactions
 		if successfulTxCount == numTransactions {
 			log.Println("Result: MariaDB history count matches total transactions!")
 		} else {
-			log.Println("Result: MariaDB history count DOES NOT match total transactions. Check Go logs for failures.")
+			log.Println("Result: MariaDB history count DOES NOT match total transactions. Check Go logs for failures during MariaDB insert.")
 		}
 	}
 }
 
 // setupRedisInitialBalance initializes the account's balance in Redis.
 func setupRedisInitialBalance(accountID int, balance int) error {
-	key := fmt.Sprintf("account:balance:%d", accountID)
+	key := fmt.Sprintf("%s:%d", spendableBalanceCache, accountID)
 	err := redisClient.Set(ctx, key, balance, 0).Err() // 0 expiry means no expiry
 	if err != nil {
 		return fmt.Errorf("failed to set initial balance in Redis for account %d: %w", accountID, err)
@@ -195,15 +182,11 @@ func setupRedisInitialBalance(accountID int, balance int) error {
 
 // setupTransactionHistoryTableOnly initializes only the transactions_history table in MariaDB.
 func setupTransactionHistoryTableOnly() error {
-	// Drop transactions_history table if it exists
 	_, err := mariadbDB.Exec(`DROP TABLE IF EXISTS transactions_history;`)
 	if err != nil {
 		return fmt.Errorf("failed to drop transactions_history table: %w", err)
 	}
 
-	// Create transactions_history table with the 'running_balance' column
-	// 'amount' here is the specific transaction's value (debit as negative)
-	// 'running_balance' is the balance after this transaction.
 	_, err = mariadbDB.Exec(`
 		CREATE TABLE transactions_history (
 			id BIGINT AUTO_INCREMENT PRIMARY KEY,
@@ -216,8 +199,6 @@ func setupTransactionHistoryTableOnly() error {
 	if err != nil {
 		return fmt.Errorf("failed to create transactions_history table: %w", err)
 	}
-	// Add a composite index for querying latest balance efficiently if needed (though Redis is source now)
-	// This index is still useful for auditing history by account.
 	_, err = mariadbDB.Exec(`CREATE INDEX idx_transactions_history_account_id_time ON transactions_history(account_id, transaction_time DESC, id DESC);`)
 	if err != nil {
 		return fmt.Errorf("failed to create index on transactions_history: %w", err)
@@ -227,42 +208,38 @@ func setupTransactionHistoryTableOnly() error {
 	return nil
 }
 
-// processRedisLedgerTransaction handles a single transaction, first updating Redis, then MariaDB.
+// processRedisLedgerTransaction handles a single transaction, first updating Redis using bsm/redislock, then MariaDB.
 func processRedisLedgerTransaction(txNum int, accountID int, debitAmount int) error {
-	redisKey := fmt.Sprintf("account:balance:%d", accountID)
+	cacheKey := fmt.Sprintf("%s:%d", spendableBalanceCache, accountID)
+	// lockKey := fmt.Sprintf("cop_spendable_balance_lock_%d", accountID) // Simplified lock key from production code
 
-	// Step 1: Atomically update balance in Redis using a Lua script
-	// This script returns the new balance if successful, or -1 for insufficient funds.
-	result, err := redisClient.Eval(ctx, redisConditionalDecrementScript, []string{redisKey}, debitAmount, initialBalance).Result()
+	var newBalance float64 // Will hold the balance after successful Redis update
+
+	// Call the separate function that mirrors production's redisLock logic
+	processedBalance, err := deductWithRedisLock(ctx, cacheKey, accountID, float64(debitAmount))
 	if err != nil {
-		// Handle specific Redis errors, e.g., script execution error, connection issues
-		return fmt.Errorf("transaction %d: Redis script execution failed: %w", txNum, err)
+		// This will return ErrInsufficientSpendableBalance or ErrLockNotObtained directly
+		return err
 	}
+	newBalance = processedBalance // Use the balance returned by deductWithRedisLock
 
-	newRedisBalance, ok := result.(int64)
-	if !ok {
-		return fmt.Errorf("transaction %d: Redis script returned unexpected type: %T", txNum, result)
-	}
-
-	if newRedisBalance == -1 {
-		// Insufficient funds as returned by the Lua script
-		return fmt.Errorf("transaction %d: insufficient balance in Redis. Debit: %d", txNum, debitAmount)
-	}
-
-	// Step 2: If Redis update was successful, record the transaction in MariaDB history
+	// Record the transaction in MariaDB history
 	// This is done in a separate MariaDB transaction for durability.
 	mariaDbTx, err := mariadbDB.Begin()
 	if err != nil {
 		return fmt.Errorf("transaction %d: failed to begin MariaDB transaction: %w", txNum, err)
 	}
-	defer mariaDbTx.Rollback() // Ensure rollback on error
+	defer mariaDbTx.Rollback() // Ensure rollback on error if insert/commit fails
 
-	// Insert into transactions_history using the new balance from Redis
 	_, err = mariaDbTx.Exec(
 		"INSERT INTO transactions_history (account_id, amount, running_balance) VALUES (?, ?, ?)",
-		accountID, -debitAmount, newRedisBalance, // Store debit as negative
+		accountID, -debitAmount, newBalance, // Use newBalance obtained from successful Redis operation
 	)
 	if err != nil {
+		// IMPORTANT: In a real system, if MariaDB fails here after Redis succeeded,
+		// you would need a robust reconciliation mechanism (e.g., compensating transaction in Redis,
+		// a message queue for retries, or dedicated audit/recovery processes)
+		// to handle the eventual consistency between Redis and MariaDB.
 		return fmt.Errorf("transaction %d: failed to insert into MariaDB history: %w", txNum, err)
 	}
 
@@ -270,24 +247,111 @@ func processRedisLedgerTransaction(txNum int, accountID int, debitAmount int) er
 	if err != nil {
 		return fmt.Errorf("transaction %d: failed to commit MariaDB history: %w", txNum, err)
 	}
-	return nil
+	return nil // Transaction successfully completed
+}
+
+// deductWithRedisLock mirrors the core logic from your production code's Deduct function's redisLock branch.
+// It uses bsm/redislock for distributed locking, performs the balance deduction in Redis.
+// Returns the new running balance after deduction, or an error.
+func deductWithRedisLock(ctx context.Context, cacheKey string, merchantID int, amount float64) (float64, error) {
+	// Retrieve current balance from Redis BEFORE acquiring lock (optimistic read for info logging, but check is inside lock)
+	runningBalanceBeforeLock, err := redisClient.Get(ctx, cacheKey).Float64()
+	if err != nil {
+		if err == goRedis.Nil { // Key not found, might be the very first transaction after setup
+			runningBalanceBeforeLock = float64(initialBalance) // Assume initial balance if not found in cache
+			// Attempt to set the initial balance in cache if it's the very first hit
+			if err := redisClient.Set(ctx, cacheKey, runningBalanceBeforeLock, 0).Err(); err != nil {
+				return 0, fmt.Errorf("failed to set initial balance in cache for first hit: %w", err)
+			}
+		} else {
+			log.Printf("deductWithRedisLock: fail to get spendable balance from cache before lock (merchantID %d): %v", merchantID, err)
+			return 0, err // Return other Redis errors
+		}
+	}
+	// log.Printf("deductWithRedisLock: Initial GET (before lock) for merchant %d, balance: %.2f", merchantID, runningBalanceBeforeLock)
+
+	lockKey := fmt.Sprintf("cop_spendable_balance_lock_%d", merchantID) // Simplified lock key from production code
+	var redisLock *redislock.Lock
+	retryCount := 1
+	const maxRetries = 3 // Mirroring production code's retry limit
+
+	for retryCount <= maxRetries { // Retry loop for obtaining lock
+		// Obtain a lock with a short TTL (100ms) and no retry strategy for `locker.Obtain` itself, as we do manual retries.
+		lock, err := redisLocker.Obtain(ctx, lockKey, 100*time.Millisecond, nil)
+		if err != nil {
+			if errors.Is(err, redislock.ErrNotObtained) {
+				log.Printf("deductWithRedisLock: fail to obtain redis lock for %s, retrying (%d/%d)", lockKey, retryCount, maxRetries)
+				if retryCount == maxRetries {
+					log.Printf("deductWithRedisLock: fail to obtain redis lock after %d retries for %s: %v", maxRetries, lockKey, err)
+					return 0, ErrLockNotObtained // Return custom error
+				}
+				retryCount++
+				time.Sleep(50 * time.Millisecond) // Small delay before retry
+				continue                          // Continue to next retry attempt
+			}
+			return 0, fmt.Errorf("deductWithRedisLock: unexpected error obtaining lock: %w", err) // Other unexpected Redis errors
+		}
+		redisLock = lock // Lock successfully obtained
+		break            // Exit retry loop
+	}
+
+	// Ensure the lock is released when the function exits
+	defer func() {
+		if redisLock != nil {
+			if err := redisLock.Release(ctx); err != nil {
+				// Log the error but don't return it, as the main operation might have succeeded.
+				log.Printf("deductWithRedisLock: failed to release redis lock %s: %v", lockKey, err)
+			} else {
+				// log.Printf("deductWithRedisLock: lock %s released successfully", lockKey)
+			}
+		}
+	}()
+
+	// log.Printf("deductWithRedisLock: process inside lock start for %s", lockKey)
+
+	// Re-read balance INSIDE the lock for the definitive check and update
+	// This is crucial. The `GET` outside the lock is just for initial info/debug.
+	currentBalanceInsideLock, err := redisClient.Get(ctx, cacheKey).Float64()
+	if err != nil {
+		if err == goRedis.Nil { // Should not happen if initial SET succeeded or first-hit logic is robust.
+			currentBalanceInsideLock = float64(initialBalance)
+		} else {
+			return 0, fmt.Errorf("failed to get balance inside lock for %s: %w", cacheKey, err)
+		}
+	}
+	// log.Printf("deductWithRedisLock: Balance inside lock for %s: %.2f", lockKey, currentBalanceInsideLock)
+
+	if amount > currentBalanceInsideLock {
+		log.Printf("deductWithRedisLock: insufficient spendable balance (%.2f) for amount (%.2f) for merchant %d", currentBalanceInsideLock, amount, merchantID)
+		return 0, ErrInsufficientSpendableBalance // Return custom error
+	}
+
+	// Perform the atomic decrement within the lock
+	newRunningBalance, err := redisClient.IncrByFloat(ctx, cacheKey, amount*-1).Result() // Decrement by amount * -1
+	if err != nil {
+		return 0, fmt.Errorf("failed to IncrByFloat for %s: %w", cacheKey, err)
+	}
+
+	// log.Printf("deductWithRedisLock: updated balance in cache for %s. New balance: %.2f", cacheKey, newRunningBalance)
+	return newRunningBalance, nil // Return the new balance
 }
 
 // getRedisBalance retrieves the current balance for a specific account directly from Redis.
 func getRedisBalance(accountID int) (int, error) {
-	key := fmt.Sprintf("account:balance:%d", accountID)
+	key := fmt.Sprintf("%s:%d", spendableBalanceCache, accountID)
 	val, err := redisClient.Get(ctx, key).Result()
 	if err != nil {
-		if err == redis.Nil {
+		if err == goRedis.Nil {
 			return 0, fmt.Errorf("account %d balance not found in Redis", accountID)
 		}
 		return 0, fmt.Errorf("failed to get balance from Redis for account %d: %w", accountID, err)
 	}
-	balance, err := strconv.Atoi(val)
+	// Redis stores floats. Convert to int for comparison with initialBalance.
+	balanceFloat, err := strconv.ParseFloat(val, 64)
 	if err != nil {
-		return 0, fmt.Errorf("failed to convert Redis balance '%s' to int: %w", val, err)
+		return 0, fmt.Errorf("failed to convert Redis balance '%s' to float: %w", val, err)
 	}
-	return balance, nil
+	return int(balanceFloat), nil // Convert to int as your constants are int
 }
 
 // getTransactionHistoryCount retrieves the total number of history entries for a specific account from MariaDB.
